@@ -1,0 +1,263 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>2FA 验证器</title>
+<script src="jsQR.js"></script>
+<style>
+  * { box-sizing: border-box; }
+  body {
+    font-family: -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+    max-width: 520px; margin: 0 auto; padding: 16px;
+    background: #faf8f3; color: #3a3a3a; line-height: 1.5;
+  }
+  h1 { font-size: 20px; font-weight: 600; margin: 8px 0 16px; }
+  .card {
+    background: #fff; border: 1px solid #ece7dd; border-radius: 12px;
+    padding: 14px; margin-bottom: 14px;
+  }
+  .card h2 { font-size: 14px; margin: 0 0 10px; color: #8a7f6d; font-weight: 600; }
+  button {
+    background: #6b8f71; color: #fff; border: none; border-radius: 8px;
+    padding: 9px 14px; font-size: 14px; cursor: pointer; margin: 4px 6px 4px 0;
+  }
+  button:disabled { background: #c4c4c4; cursor: not-allowed; }
+  button.alt { background: #b08968; }
+  input[type=text], textarea {
+    width: 100%; padding: 9px; border: 1px solid #ddd6c8; border-radius: 8px;
+    font-size: 14px; font-family: monospace; resize: vertical; margin-bottom: 8px;
+  }
+  video { width: 100%; border-radius: 8px; background: #000; display: none; }
+  #otpBox { text-align: center; padding: 18px 10px; display: none; }
+  #otpCode { font-size: 40px; font-weight: 700; letter-spacing: 4px; color: #3a3a3a; margin: 6px 0; }
+  #otpMeta { font-size: 12px; color: #8a7f6d; }
+  .bar { height: 5px; background: #ece7dd; border-radius: 4px; overflow: hidden; margin-top: 10px; }
+  .bar > div { height: 100%; background: #6b8f71; transition: width .3s linear; }
+  .msg { font-size: 12px; color: #b08968; margin-top: 6px; min-height: 16px; }
+  .hint { font-size: 11px; color: #aaa; margin-top: 6px; }
+</style>
+</head>
+<body>
+  <h1>2FA 验证器</h1>
+
+  <div class="card">
+    <h2>① 摄像头扫码</h2>
+    <button id="camBtn">打开摄像头</button>
+    <button id="camStop" disabled>停止</button>
+    <video id="video" playsinline></video>
+    <div class="msg" id="camMsg"></div>
+  </div>
+
+  <div class="card">
+    <h2>② 上传二维码图片</h2>
+    <input type="file" id="fileInput" accept="image/*">
+    <div class="msg" id="fileMsg"></div>
+  </div>
+
+  <div class="card">
+    <h2>③ 粘贴 / 输入文本码</h2>
+    <textarea id="textInput" rows="2" placeholder="粘贴 otpauth://... 链接，或输入 Base32 密钥（如 JBSWY3DPEHPK3PXP）"></textarea>
+    <button id="textBtn">生成 TOTP</button>
+    <div class="msg" id="textMsg"></div>
+  </div>
+
+  <div class="card" id="otpBox">
+    <h2>当前验证码</h2>
+    <div id="otpCode">------</div>
+    <div id="otpMeta"></div>
+    <div class="bar"><div id="otpBar"></div></div>
+    <div style="margin-top:12px">
+      <button class="alt" id="downloadBtn">下载备份文件</button>
+    </div>
+    <div class="hint">备份文件名：2fa验证.勿分享或泄露.txt</div>
+  </div>
+
+<script>
+// ---------- 状态 ----------
+let current = null; // { raw, secret, digits, period, algo }
+let timer = null;
+let camStream = null;
+let camRAF = null;
+
+// ---------- Base32 解码 ----------
+function base32Decode(str) {
+  str = str.replace(/=+$/,'').toUpperCase().replace(/\s/g,'');
+  const alpha = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
+  let bits = 0, value = 0;
+  const out = [];
+  for (let i = 0; i < str.length; i++) {
+    const idx = alpha.indexOf(str[i]);
+    if (idx === -1) continue;
+    value = (value << 5) | idx;
+    bits += 5;
+    if (bits >= 8) { out.push((value >>> (bits - 8)) & 0xff); bits -= 8; }
+  }
+  return new Uint8Array(out);
+}
+
+// ---------- 解析 otpauth / 纯文本 ----------
+function parseSecret(input) {
+  input = (input || '').trim();
+  if (!input) return null;
+  if (input.toLowerCase().startsWith('otpauth://')) {
+    try {
+      const u = new URL(input);
+      const secret = u.searchParams.get('secret');
+      if (!secret) return null;
+      const digits = parseInt(u.searchParams.get('digits') || '6', 10);
+      const period = parseInt(u.searchParams.get('period') || '30', 10);
+      let algo = (u.searchParams.get('algorithm') || 'SHA1').toUpperCase();
+      algo = algo.replace('SHA1','SHA-1').replace('SHA256','SHA-256').replace('SHA512','SHA-512');
+      return { raw: input, secret, digits, period, algo };
+    } catch (e) { return null; }
+  }
+  return { raw: input, secret: input, digits: 6, period: 30, algo: 'SHA-1' };
+}
+
+// ---------- 生成 TOTP (RFC 6238, Web Crypto) ----------
+async function totp(secret, digits, period, algo) {
+  const counter = Math.floor(Date.now() / 1000 / period);
+  const buf = new ArrayBuffer(8);
+  const dv = new DataView(buf);
+  dv.setUint32(0, Math.floor(counter / 0x100000000));
+  dv.setUint32(4, counter >>> 0);
+  const key = await crypto.subtle.importKey(
+    'raw', base32Decode(secret), { name: 'HMAC', hash: { name: algo } }, false, ['sign']);
+  const sig = new Uint8Array(await crypto.subtle.sign('HMAC', key, buf));
+  const off = sig[sig.length - 1] & 0x0f;
+  let code = ((sig[off] & 0x7f) << 24) | (sig[off+1] << 16) | (sig[off+2] << 8) | sig[off+3];
+  code = code >>> 0;
+  code = code % Math.pow(10, digits);
+  return code.toString().padStart(digits, '0');
+}
+
+// ---------- 渲染 / 倒计时 ----------
+async function render() {
+  if (!current) return;
+  const code = await totp(current.secret, current.digits, current.period, current.algo);
+  document.getElementById('otpCode').textContent = code;
+  document.getElementById('otpMeta').textContent =
+    current.digits + ' 位 · 周期 ' + current.period + 's · ' + current.algo;
+  const remain = current.period - (Math.floor(Date.now()/1000) % current.period);
+  document.getElementById('otpBar').style.width = (remain / current.period * 100) + '%';
+}
+
+function startTOTP(cfg) {
+  current = cfg;
+  document.getElementById('otpBox').style.display = 'block';
+  clearInterval(timer);
+  render();
+  timer = setInterval(render, 1000);
+  triggerDownload(); // 识别到后自动弹出备份下载
+}
+
+// ---------- 备份文件下载 ----------
+function triggerDownload() {
+  if (!current) return;
+  const c = current;
+  const content =
+    '2FA 备份 —— 请勿分享或泄露\n' +
+    '================================\n' +
+    'Secret : ' + c.secret + '\n' +
+    'Digits : ' + c.digits + '\n' +
+    'Period : ' + c.period + '\n' +
+    'Algo   : ' + c.algo + '\n' +
+    '--------------------------------\n' +
+    'otpauth: otpauth://totp/2fa?secret=' + encodeURIComponent(c.secret) +
+      '&digits=' + c.digits + '&period=' + c.period + '&algorithm=' + c.algo.replace('-','') + '\n';
+  const blob = new Blob([content], { type: 'text/plain;charset=utf-8' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = '2fa验证.勿分享或泄露.txt';
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(a.href);
+}
+
+// ---------- 摄像头扫码 ----------
+const video = document.getElementById('video');
+const camMsg = document.getElementById('camMsg');
+document.getElementById('camBtn').onclick = async () => {
+  try {
+    camStream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' } });
+    video.srcObject = camStream;
+    video.style.display = 'block';
+    await video.play();
+    document.getElementById('camBtn').disabled = true;
+    document.getElementById('camStop').disabled = false;
+    camMsg.textContent = '正在扫描…将二维码对准摄像头';
+    scanLoop();
+  } catch (e) {
+    camMsg.textContent = '无法打开摄像头：' + e.message;
+  }
+};
+document.getElementById('camStop').onclick = stopCam;
+function stopCam() {
+  if (camRAF) cancelAnimationFrame(camRAF);
+  if (camStream) camStream.getTracks().forEach(t => t.stop());
+  video.style.display = 'none';
+  document.getElementById('camBtn').disabled = false;
+  document.getElementById('camStop').disabled = true;
+  camMsg.textContent = '';
+}
+function scanLoop() {
+  if (video.videoWidth === 0) { camRAF = requestAnimationFrame(scanLoop); return; }
+  const cv = document.createElement('canvas');
+  cv.width = video.videoWidth; cv.height = video.videoHeight;
+  const ctx = cv.getContext('2d');
+  ctx.drawImage(video, 0, 0, cv.width, cv.height);
+  const img = ctx.getImageData(0, 0, cv.width, cv.height);
+  const res = jsQR(img.data, img.width, img.height);
+  if (res && res.data) {
+    const cfg = parseSecret(res.data);
+    if (cfg) {
+      camMsg.textContent = '扫码成功！';
+      stopCam();
+      startTOTP(cfg);
+      return;
+    }
+  }
+  camRAF = requestAnimationFrame(scanLoop);
+}
+
+// ---------- 上传二维码图片 ----------
+document.getElementById('fileInput').onchange = (e) => {
+  const f = e.target.files[0];
+  const msg = document.getElementById('fileMsg');
+  if (!f) return;
+  const img = new Image();
+  const url = URL.createObjectURL(f);
+  img.onload = () => {
+    const cv = document.createElement('canvas');
+    cv.width = img.width; cv.height = img.height;
+    const ctx = cv.getContext('2d');
+    ctx.drawImage(img, 0, 0);
+    const data = ctx.getImageData(0, 0, cv.width, cv.height);
+    const res = jsQR(data.data, data.width, data.height);
+    URL.revokeObjectURL(url);
+    if (res && res.data) {
+      const cfg = parseSecret(res.data);
+      if (cfg) { msg.textContent = '识别成功！'; startTOTP(cfg); return; }
+    }
+    msg.textContent = '未能从图片中识别出二维码，请确认图片清晰。';
+  };
+  img.onerror = () => { URL.revokeObjectURL(url); msg.textContent = '图片加载失败。'; };
+  img.src = url;
+};
+
+// ---------- 文本 / 粘贴 ----------
+document.getElementById('textBtn').onclick = () => {
+  const v = document.getElementById('textInput').value;
+  const msg = document.getElementById('textMsg');
+  const cfg = parseSecret(v);
+  if (cfg) { msg.textContent = '已设置，开始生成验证码'; startTOTP(cfg); }
+  else msg.textContent = '请输入有效的 otpauth 链接或 Base32 密钥。';
+};
+
+// ---------- 下载按钮 ----------
+document.getElementById('downloadBtn').onclick = triggerDownload;
+</script>
+</body>
+</html>
